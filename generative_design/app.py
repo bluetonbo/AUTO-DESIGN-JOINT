@@ -6,10 +6,10 @@ UI/레이아웃: JOINT-AI-APP-6.py와 동일한 다크 콘솔 테마 적용
 
 import sys
 import os
+import io
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import dataclasses
 from datetime import datetime, timedelta
 
 import streamlit as st
@@ -152,21 +152,17 @@ st.markdown("""
 
 try:
     GCP_CREDENTIALS = dict(st.secrets["gcp_service_account"])
-    SHEET_ID = st.secrets["sheet_id"]
-    WORKSHEET_NAME = st.secrets.get("worksheet_name", "")
-    CONFIG = dataclasses.replace(
-        BASE_CONFIG,
-        data_source="gsheet",
-        sheet_id=SHEET_ID,
-        worksheet_name=WORKSHEET_NAME,
-    )
+    SHEET_ID = st.secrets["sheet_id"]  # 로그인/임시비번 저장용 (설계 데이터와는 무관)
 except KeyError:
     st.error(
         "Google Sheets 연동 정보(secrets)가 없습니다. "
         "Streamlit Cloud의 App settings → Secrets에 "
-        "`gcp_service_account`, `sheet_id`를 등록해주세요."
+        "`gcp_service_account`, `sheet_id`를 등록해주세요. "
+        "(로그인/임시비번 저장에 사용됩니다)"
     )
     st.stop()
+
+CONFIG = BASE_CONFIG  # 설계 데이터는 파일 업로드로 받으므로 sheet 관련 설정 불필요
 
 # ──────────────────────────────────────────────────────────────
 # 인증 시스템 (JOINT-AI-APP-6.py와 동일한 방식)
@@ -300,9 +296,10 @@ st.markdown(
 
 
 @st.cache_data(show_spinner=False)
-def compute_candidates(pop_size: int, n_generations: int, seed: int):
+def compute_candidates(file_bytes: bytes, pop_size: int, n_generations: int, seed: int):
+    raw_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None)
     variables, objectives, var_cols, data, kpi_spec_ranges, parse_report = load_part_data(
-        CONFIG, gcp_credentials=GCP_CREDENTIALS
+        CONFIG, raw=raw_df
     )
     models, cv_scores = train_surrogate_models(var_cols, data, CONFIG.kpi_columns)
     predictor = make_predictor(models, CONFIG)
@@ -313,6 +310,15 @@ def compute_candidates(pop_size: int, n_generations: int, seed: int):
 
 
 with st.sidebar:
+    st.markdown("### 📂 입력 데이터")
+    uploaded_file = st.file_uploader(
+        "설계/실측 데이터 파일 업로드 (XLSX)",
+        type=["xlsx"],
+        help="VOLVO_SPA12_CABJ_TRAIN_DATA 형식과 동일한 레이아웃의 엑셀 파일",
+    )
+
+    st.divider()
+
     st.markdown("### ⚙️ 데이터 컨트롤")
     pop_size = st.slider("Population Size", 40, 300, 120, step=20)
     n_generations = st.slider("세대 수 (Generations)", 20, 200, 60, step=10)
@@ -390,9 +396,18 @@ with st.sidebar:
         else:
             st.caption("등록된 임시 비밀번호가 없습니다.")
 
-if "computed" not in st.session_state or run_btn:
+if uploaded_file is None and "computed" not in st.session_state:
+    st.info(
+        "📂 학습 비활성화: 왼쪽 사이드바에서 입력 데이터 파일(XLSX)을 업로드해주세요.\n\n"
+        "VOLVO_SPA12_CABJ_TRAIN_DATA 원본과 동일한 레이아웃(2행: 변수명, 9행: 스펙, 3~8행: 실측 데이터)이어야 합니다."
+    )
+    st.stop()
+
+if uploaded_file is not None and (run_btn or "computed" not in st.session_state):
     with st.spinner("NSGA-II 다목적 최적화 실행 중..."):
-        st.session_state["computed"] = compute_candidates(pop_size, n_generations, seed)
+        st.session_state["computed"] = compute_candidates(
+            uploaded_file.getvalue(), pop_size, n_generations, seed
+        )
 
 candidates, valid, objectives, kpi_spec_ranges, cv_scores, parse_report, n_samples = st.session_state["computed"]
 kpi_names = [o.name for o in objectives]

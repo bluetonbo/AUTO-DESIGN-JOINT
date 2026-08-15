@@ -7,6 +7,8 @@ UI/레이아웃: JOINT-AI-APP-6.py와 동일한 다크 콘솔 테마 적용
 import sys
 import os
 import io
+import sqlite3
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -295,9 +297,39 @@ st.markdown(
 )
 
 
+def _load_raw_from_bytes(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    """xlsx 또는 db(SQLite) 업로드 파일을 원본 시트와 동일한 위치기반(raw) 표로 변환.
+
+    - xlsx: pd.read_excel(header=None)과 동일하게 위치 그대로 읽음
+    - db: 첫 번째 테이블을 그대로 읽어옴. 컬럼 "이름"은 무관하며(엔진은 위치(iloc)로만
+      접근), 테이블의 행/열 순서가 원본 엑셀 시트의 셀 배치와 동일해야 함
+      (예: A열=라벨, B열~=값, 2행=변수명, 9행=스펙, 3~8행=데이터)
+    """
+    if file_name.lower().endswith(".db"):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
+            conn = sqlite3.connect(tmp_path)
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'", conn
+            )
+            if len(tables) == 0:
+                raise ValueError("DB 파일에 테이블이 없습니다.")
+            table_name = tables.iloc[0]["name"]
+            df = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
+            conn.close()
+        finally:
+            os.remove(tmp_path)
+        # 위치 기반 접근을 위해 컬럼명을 정수 인덱스로 재설정 (이름은 무관, 순서만 중요)
+        df.columns = range(df.shape[1])
+        return df
+    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None)
+
+
 @st.cache_data(show_spinner=False)
-def compute_candidates(file_bytes: bytes, pop_size: int, n_generations: int, seed: int):
-    raw_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None)
+def compute_candidates(file_bytes: bytes, file_name: str, pop_size: int, n_generations: int, seed: int):
+    raw_df = _load_raw_from_bytes(file_bytes, file_name)
     variables, objectives, var_cols, data, kpi_spec_ranges, parse_report = load_part_data(
         CONFIG, raw=raw_df
     )
@@ -312,9 +344,9 @@ def compute_candidates(file_bytes: bytes, pop_size: int, n_generations: int, see
 with st.sidebar:
     st.markdown("### 📂 입력 데이터")
     uploaded_file = st.file_uploader(
-        "설계/실측 데이터 파일 업로드 (XLSX)",
-        type=["xlsx"],
-        help="VOLVO_SPA12_CABJ_TRAIN_DATA 형식과 동일한 레이아웃의 엑셀 파일",
+        "설계/실측 데이터 파일 업로드 (XLSX, DB)",
+        type=["xlsx", "db"],
+        help="VOLVO_SPA12_CABJ_TRAIN_DATA 형식과 동일한 레이아웃의 엑셀 또는 SQLite DB 파일",
     )
 
     st.divider()
@@ -396,18 +428,22 @@ with st.sidebar:
         else:
             st.caption("등록된 임시 비밀번호가 없습니다.")
 
-if uploaded_file is None and "computed" not in st.session_state:
+if uploaded_file is None:
     st.info(
-        "📂 학습 비활성화: 왼쪽 사이드바에서 입력 데이터 파일(XLSX)을 업로드해주세요.\n\n"
+        "📂 학습 비활성화: 왼쪽 사이드바에서 입력 데이터 파일(XLSX 또는 DB)을 업로드해주세요.\n\n"
         "VOLVO_SPA12_CABJ_TRAIN_DATA 원본과 동일한 레이아웃(2행: 변수명, 9행: 스펙, 3~8행: 실측 데이터)이어야 합니다."
     )
     st.stop()
 
-if uploaded_file is not None and (run_btn or "computed" not in st.session_state):
+if run_btn:
     with st.spinner("NSGA-II 다목적 최적화 실행 중..."):
         st.session_state["computed"] = compute_candidates(
-            uploaded_file.getvalue(), pop_size, n_generations, seed
+            uploaded_file.getvalue(), uploaded_file.name, pop_size, n_generations, seed
         )
+
+if "computed" not in st.session_state:
+    st.info("🚀 파일 업로드가 완료되었습니다. 사이드바의 \"학습 초기화 및 재계산 실행\" 버튼을 눌러 계산을 시작하세요.")
+    st.stop()
 
 candidates, valid, objectives, kpi_spec_ranges, cv_scores, parse_report, n_samples = st.session_state["computed"]
 kpi_names = [o.name for o in objectives]
@@ -530,9 +566,26 @@ with tab2:
         )
 
         st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-        csv = sorted_valid.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ 전체 후보 CSV 다운로드 (전체 치수 포함)", csv,
-                            file_name="ball_joint_generative_candidates.csv", mime="text/csv")
+        dl_col1, dl_col2 = st.columns([1, 1])
+        with dl_col1:
+            dl_fmt = st.selectbox("내보내기 파일 포맷 선택", ["Excel/CSV (.csv)", "Database (.db)"],
+                                   key="candidates_dl_fmt", label_visibility="collapsed")
+        with dl_col2:
+            if "CSV" in dl_fmt:
+                csv = sorted_valid.to_csv(index=False).encode("utf-8-sig")
+                st.download_button("⬇️ 전체 후보 다운로드", csv,
+                                    file_name="ball_joint_generative_candidates.csv", mime="text/csv")
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp_out:
+                    tmp_out_path = tmp_out.name
+                conn_out = sqlite3.connect(tmp_out_path)
+                sorted_valid.to_sql("candidates", conn_out, index=False, if_exists="replace")
+                conn_out.close()
+                with open(tmp_out_path, "rb") as f:
+                    db_bytes = f.read()
+                os.remove(tmp_out_path)
+                st.download_button("⬇️ 전체 후보 다운로드", db_bytes,
+                                    file_name="ball_joint_generative_candidates.db", mime="application/x-sqlite3")
 
         st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
         st.markdown("<p style='font-size:0.85rem;font-weight:700;color:#ff9f1c;'>▣ 후보 상세 치수 보기</p>", unsafe_allow_html=True)

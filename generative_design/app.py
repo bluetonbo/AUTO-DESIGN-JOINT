@@ -1,15 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Generative Design 대시보드 (Streamlit)
-
-기능:
-  - NSGA-II 파레토 후보 재계산 (캐시됨, 파라미터 바꾸면 재실행)
-  - 2개 KPI를 골라 파레토 프론트 산점도 (3번째 KPI는 색상으로 표시)
-  - 스펙 통과 후보만 필터링해서 표/다운로드
-  - 특정 후보를 골라 전체 34개 치수 상세 확인
-
-실행:
-  cd /home/claude && streamlit run generative_design/app.py
 """
 
 import sys
@@ -17,19 +8,39 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import dataclasses
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from generative_design.configs.ball_joint_volvo import CONFIG
+from generative_design.configs.ball_joint_volvo import CONFIG as BASE_CONFIG
 from generative_design.engine import (
     load_part_data, train_surrogate_models, make_predictor,
     run_nsga2, filter_within_spec,
 )
 
+try:
+    GCP_CREDENTIALS = dict(st.secrets["gcp_service_account"])
+    SHEET_ID = st.secrets["sheet_id"]
+    WORKSHEET_NAME = st.secrets.get("worksheet_name", "")
+    CONFIG = dataclasses.replace(
+        BASE_CONFIG,
+        data_source="gsheet",
+        sheet_id=SHEET_ID,
+        worksheet_name=WORKSHEET_NAME,
+    )
+except KeyError:
+    st.error(
+        "Google Sheets 연동 정보(secrets)가 없습니다. "
+        "Streamlit Cloud의 App settings → Secrets에 "
+        "`gcp_service_account`, `sheet_id`를 등록해주세요."
+    )
+    st.stop()
+
 st.set_page_config(page_title="Generative Design - 볼조인트", layout="wide")
 
-PRIMARY = "#0054A6"  # ILJIN CI blue
+PRIMARY = "#0054A6"
 
 st.markdown(
     f"""
@@ -46,7 +57,9 @@ st.caption(f"부품: **{CONFIG.part_name}**  ·  NSGA-II 다목적 최적화 기
 
 @st.cache_data(show_spinner=False)
 def compute_candidates(pop_size: int, n_generations: int, seed: int):
-    variables, objectives, var_cols, data, kpi_spec_ranges, parse_report = load_part_data(CONFIG)
+    variables, objectives, var_cols, data, kpi_spec_ranges, parse_report = load_part_data(
+        CONFIG, gcp_credentials=GCP_CREDENTIALS
+    )
     models, cv_scores = train_surrogate_models(var_cols, data, CONFIG.kpi_columns)
     predictor = make_predictor(models, CONFIG)
     candidates = run_nsga2(variables, objectives, predictor, CONFIG,
@@ -83,9 +96,6 @@ col4.metric("설계변수 / KPI", f"{len([p for p in parse_report if p[1] not in
 
 tab1, tab2, tab3 = st.tabs(["📊 파레토 프론트", "📋 후보 목록", "🧬 변수 구성"])
 
-# ------------------------------------------------------------------
-# Tab 1: 파레토 프론트 시각화
-# ------------------------------------------------------------------
 with tab1:
     show_df = valid if len(valid) > 0 else candidates
     if len(valid) == 0:
@@ -111,9 +121,6 @@ with tab1:
         "위치할수록 '이 두 지표 사이에서는 더 개선할 여지가 없는' 효율적인 후보입니다."
     )
 
-# ------------------------------------------------------------------
-# Tab 2: 후보 목록 + 상세
-# ------------------------------------------------------------------
 with tab2:
     st.subheader("스펙 통과 후보")
     if len(valid) > 0:
@@ -143,9 +150,6 @@ with tab2:
     else:
         st.info("스펙 통과 후보가 없습니다.")
 
-# ------------------------------------------------------------------
-# Tab 3: 변수 구성 (파생/고정/스펙파싱 현황)
-# ------------------------------------------------------------------
 with tab3:
     st.subheader("설계변수 구성 리포트")
     report_df = pd.DataFrame(

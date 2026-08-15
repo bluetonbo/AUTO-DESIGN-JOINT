@@ -10,10 +10,13 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import dataclasses
+from datetime import datetime, timedelta
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import gspread
+from google.oauth2.service_account import Credentials
 
 from generative_design.configs.ball_joint_volvo import CONFIG as BASE_CONFIG
 from generative_design.engine import (
@@ -165,6 +168,126 @@ except KeyError:
     )
     st.stop()
 
+# ──────────────────────────────────────────────────────────────
+# 인증 시스템 (JOINT-AI-APP-6.py와 동일한 방식)
+# 같은 Google Sheets 문서 안에 "temp_pwd_store" 탭을 두고 임시 비번을 관리합니다.
+# ──────────────────────────────────────────────────────────────
+_TEMP_PWD_WORKSHEET = "temp_pwd_store"
+OWNER_PWD = "nt1234"  # 소유자 비번 (항상 유효)
+
+
+@st.cache_resource(show_spinner=False)
+def _get_temp_pwd_worksheet():
+    """Google Sheets 워크시트 연결 객체를 세션 내에서 재사용(캐싱). 쓰기 권한 필요."""
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(GCP_CREDENTIALS, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SHEET_ID)
+    try:
+        ws = sh.worksheet(_TEMP_PWD_WORKSHEET)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=_TEMP_PWD_WORKSHEET, rows=200, cols=3)
+        ws.update([["password", "expires", "created"]])
+    return ws
+
+
+def _load_temp_pwds():
+    """Google Sheets에서 임시 비번 목록 로드 — Streamlit Reboot 후에도 유지"""
+    try:
+        ws = _get_temp_pwd_worksheet()
+        records = ws.get_all_records()
+        st.session_state["_sheets_last_error"] = None
+        result = {}
+        for row in records:
+            pwd = str(row.get("password", "")).strip()
+            if not pwd:
+                continue
+            exp = row.get("expires")
+            cre = row.get("created")
+            result[pwd] = {
+                "expires": datetime.fromisoformat(exp) if exp else None,
+                "created": datetime.fromisoformat(cre) if cre else datetime.now(),
+            }
+        return result
+    except Exception as e:
+        st.session_state["_sheets_last_error"] = f"[로드 실패] {type(e).__name__}: {e}"
+        return {}
+
+
+def _save_temp_pwds(pwd_dict):
+    """임시 비번 목록을 Google Sheets에 저장 (전체 덮어쓰기)"""
+    try:
+        ws = _get_temp_pwd_worksheet()
+        rows = [["password", "expires", "created"]]
+        for pwd, info in pwd_dict.items():
+            exp = info.get("expires")
+            cre = info.get("created")
+            rows.append([
+                pwd,
+                exp.isoformat() if isinstance(exp, datetime) else (exp if isinstance(exp, str) else ""),
+                cre.isoformat() if isinstance(cre, datetime) else (cre if isinstance(cre, str) else str(datetime.now())),
+            ])
+        ws.clear()
+        ws.update(rows)
+        st.session_state["_sheets_last_error"] = None
+        return True
+    except Exception as e:
+        st.session_state["_sheets_last_error"] = f"[저장 실패] {type(e).__name__}: {e}"
+        return False
+
+
+def _check_temp_pwd(p):
+    """임시 비번 유효성 검사 — 시트에서 항상 최신 목록 확인"""
+    fresh = _load_temp_pwds()
+    st.session_state.temp_pwd_list = fresh
+    info = fresh.get(p)
+    if info is None:
+        return False
+    if info["expires"] is None:  # 만료일 없음 = 무기한
+        return True
+    return datetime.now() < info["expires"]
+
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "is_owner" not in st.session_state:
+    st.session_state.is_owner = False
+if "temp_pwd_list" not in st.session_state:
+    st.session_state.temp_pwd_list = _load_temp_pwds()
+
+if not st.session_state.authenticated:
+    _, center, _ = st.columns([1, 1.8, 1])
+    with center:
+        st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
+        st.markdown(
+            """<div class='glass-card' style='text-align:center; padding:22px 36px; margin-top:12px;'>
+                <div style='color:#ff9f1c; font-size:0.78rem; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:8px;'>GENERATIVE DESIGN SYSTEM</div>
+                <h2 style='color:#f2f2f2; font-size:1.35rem; font-weight:600; margin:0 0 4px 0;'>🔧 설계안 자동 생성 로그인</h2>
+                <div style='width:56px; height:2px; background:#10b981; margin:12px auto 0 auto;'></div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+        pw_col, btn_col = st.columns([4, 1])
+        with pw_col:
+            pwd = st.text_input(
+                "비밀번호", type="password", label_visibility="collapsed", placeholder="비밀번호 입력"
+            )
+        with btn_col:
+            login_btn = st.button("접속", type="primary", use_container_width=True)
+        if login_btn:
+            if pwd == OWNER_PWD:
+                st.session_state.authenticated = True
+                st.session_state.is_owner = True
+                st.rerun()
+            elif _check_temp_pwd(pwd):
+                st.session_state.authenticated = True
+                st.session_state.is_owner = False
+                st.session_state.logged_temp_pwd = pwd
+                st.rerun()
+            else:
+                st.error("비밀번호가 올바르지 않습니다.")
+    st.stop()
+
 st.markdown(
     f"""<div class='glass-card' style='text-align:center; padding:22px 36px; margin-top:12px;'>
         <div style='color:#ff9f1c; font-size:0.78rem; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:8px;'>GENERATIVE DESIGN SYSTEM</div>
@@ -201,6 +324,71 @@ with st.sidebar:
         "⚠️ 실측 데이터가 6개 샘플뿐입니다. 이 대시보드의 예측치는 "
         "파이프라인 검증용 참고 자료이며, 실제 설계 확정에는 데이터 추가 확보가 필요합니다."
     )
+
+    # ── 소유자 전용: 임시 비번 관리 패널 ──────────────────────────
+    if st.session_state.get("is_owner", False):
+        st.divider()
+        st.markdown("### 🔐 임시 비밀번호 관리")
+
+        sheets_err = st.session_state.get("_sheets_last_error")
+        if sheets_err:
+            st.error(f"⚠️ Google Sheets 오류\n\n{sheets_err}")
+        else:
+            st.caption("🟢 Google Sheets 연결 정상")
+
+        if st.button("🔄 Sheets 연결 테스트", key="sb_test_sheets", use_container_width=True):
+            try:
+                test_ws = _get_temp_pwd_worksheet()
+                test_ws.get_all_records()
+                st.session_state["_sheets_last_error"] = None
+                st.success("✅ Sheets 연결 성공")
+            except Exception as e_test:
+                st.session_state["_sheets_last_error"] = f"[테스트 실패] {type(e_test).__name__}: {e_test}"
+                st.error(f"⚠️ {st.session_state['_sheets_last_error']}")
+
+        new_tp = st.text_input("새 임시 비밀번호", key="sb_new_tp")
+        exp_opt = st.selectbox("유효 기간", ["1일", "3일", "7일", "30일", "무제한"], key="sb_exp_sel")
+        day_map = {"1일": 1, "3일": 3, "7일": 7, "30일": 30, "무제한": None}
+
+        if st.button("➕ 추가", key="sb_add_tp", use_container_width=True):
+            if new_tp and new_tp != OWNER_PWD:
+                days = day_map.get(exp_opt)
+                exp_dt = (datetime.now() + timedelta(days=days)) if days else None
+                st.session_state.temp_pwd_list[new_tp] = {"expires": exp_dt, "created": datetime.now()}
+                saved_ok = _save_temp_pwds(st.session_state.temp_pwd_list)
+                if saved_ok:
+                    st.success(f"추가됨: {new_tp}")
+                else:
+                    st.error("⚠️ Sheets 저장 실패 — 위 오류 메시지를 확인하세요 (재시작 시 사라질 수 있습니다)")
+                st.rerun()
+            elif new_tp == OWNER_PWD:
+                st.error("소유자 비번은 사용할 수 없습니다.")
+            else:
+                st.warning("비밀번호를 입력하세요.")
+
+        if st.session_state.temp_pwd_list:
+            st.caption("등록된 임시 비밀번호")
+            for tp_k, tp_v in list(st.session_state.temp_pwd_list.items()):
+                exp_v = tp_v["expires"]
+                if exp_v is None:
+                    icon, txt = "🟢", "무제한"
+                elif datetime.now() < exp_v:
+                    hrs = int((exp_v - datetime.now()).total_seconds() // 3600)
+                    icon, txt = "🟡", f"남음: {hrs}시간"
+                else:
+                    icon, txt = "🔴", "만료됨"
+                rc1, rc2 = st.columns([3, 1])
+                rc1.markdown(
+                    f"<span style='font-size:0.8rem;'>{icon} <code>{tp_k}</code><br>"
+                    f"<span style='color:#8a8a8a;font-size:0.72rem;'>{txt}</span></span>",
+                    unsafe_allow_html=True,
+                )
+                if rc2.button("🗑️", key=f"sb_del_{tp_k}"):
+                    del st.session_state.temp_pwd_list[tp_k]
+                    _save_temp_pwds(st.session_state.temp_pwd_list)
+                    st.rerun()
+        else:
+            st.caption("등록된 임시 비밀번호가 없습니다.")
 
 if "computed" not in st.session_state or run_btn:
     with st.spinner("NSGA-II 다목적 최적화 실행 중..."):

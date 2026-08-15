@@ -260,7 +260,7 @@ if not st.session_state.authenticated:
         st.markdown(
             """<div class='glass-card' style='text-align:center; padding:22px 36px; margin-top:12px;'>
                 <div style='color:#ff9f1c; font-size:0.78rem; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:8px;'>GENERATIVE DESIGN SYSTEM</div>
-                <h2 style='color:#f2f2f2; font-size:1.35rem; font-weight:600; margin:0 0 4px 0;'>🔧 설계안 자동 생성 로그인</h2>
+                <h2 style='color:#f2f2f2; font-size:1.35rem; font-weight:600; margin:0 0 4px 0;'>설계안 자동 생성 로그인</h2>
                 <div style='width:56px; height:2px; background:#10b981; margin:12px auto 0 auto;'></div>
             </div>""",
             unsafe_allow_html=True,
@@ -289,7 +289,7 @@ if not st.session_state.authenticated:
 st.markdown(
     f"""<div class='glass-card' style='text-align:center; padding:22px 36px; margin-top:12px;'>
         <div style='color:#ff9f1c; font-size:0.78rem; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:8px;'>GENERATIVE DESIGN SYSTEM</div>
-        <div style='font-size:1.7rem; font-weight:700; color:#f2f2f2;'>🔧 설계안 자동 생성 &nbsp; V1.0</div>
+        <div style='font-size:1.7rem; font-weight:700; color:#f2f2f2;'>설계안 자동 생성 &nbsp; V1.0</div>
         <div style='color:#8a8a8a; font-size:0.85rem; margin-top:6px;'>부품: {CONFIG.part_name} · NSGA-II 다목적 최적화 기반 파레토 후보 탐색</div>
         <div style='width:56px; height:2px; background:#10b981; margin:12px auto 0 auto;'></div>
     </div>""",
@@ -327,122 +327,157 @@ def _load_raw_from_bytes(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     return pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None)
 
 
-@st.cache_data(show_spinner=False)
-def compute_candidates(file_bytes: bytes, file_name: str, pop_size: int, n_generations: int, seed: int):
+def run_pipeline(file_bytes: bytes, file_name: str, pop_size: int, n_generations: int, seed: int):
+    """대리모델 학습 + NSGA-II 최적화를 진행상황을 표시하며 실행 (JOINT-AI-APP-6.py와 동일한 진행바 방식)."""
     raw_df = _load_raw_from_bytes(file_bytes, file_name)
     variables, objectives, var_cols, data, kpi_spec_ranges, parse_report = load_part_data(
         CONFIG, raw=raw_df
     )
-    models, cv_scores = train_surrogate_models(var_cols, data, CONFIG.kpi_columns)
+
+    # 1) 대리모델 학습 진행상황
+    train_prog = st.progress(0, text="대리모델 학습 준비 중... (0%)")
+    algo_status = st.empty()
+    total_kpi = len(CONFIG.kpi_columns)
+
+    def kpi_progress(idx, total, kpi_name, status, extra):
+        pct = idx / total
+        kor = CONFIG.kor_labels.get(kpi_name, "")
+        if status == "start":
+            train_prog.progress(pct, text=f"({idx + 1}/{total}) {kpi_name} 대리모델 학습 중... ({int(pct * 100)}%)")
+            algo_status.markdown(
+                f"<div style='background:#131313;border-left:3px solid #ff9f1c;border-radius:5px;padding:5px 10px;"
+                f"font-size:0.75rem;color:#d4d4d4;'>학습 중 -&gt; <b style='color:#ff9f1c;'>{kpi_name}</b>"
+                f" ({kor})</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            algo_status.markdown(
+                f"<div style='background:#131313;border-left:3px solid #10b981;border-radius:5px;padding:5px 10px;"
+                f"font-size:0.75rem;color:#a3e635;'>완료: {kpi_name} 학습 완료 (LOO-MAE={extra:.4f})</div>",
+                unsafe_allow_html=True,
+            )
+
+    models, cv_scores = train_surrogate_models(
+        var_cols, data, CONFIG.kpi_columns, progress_callback=kpi_progress
+    )
+    train_prog.progress(1.0, text="대리모델 학습 완료 (100%)")
+    algo_status.empty()
+
     predictor = make_predictor(models, CONFIG)
-    candidates = run_nsga2(variables, objectives, predictor, CONFIG,
-                            pop_size=pop_size, n_generations=n_generations, seed=seed)
+
+    # 2) NSGA-II 최적화 진행상황
+    opt_prog = st.progress(0, text="NSGA-II 최적화 준비 중... (0%)")
+
+    def gen_progress(gen, total):
+        pct = gen / total
+        opt_prog.progress(pct, text=f"세대 진행 중 ({gen}/{total}) ({int(pct * 100)}%)")
+
+    candidates = run_nsga2(
+        variables, objectives, predictor, CONFIG,
+        pop_size=pop_size, n_generations=n_generations, seed=seed,
+        progress_callback=gen_progress,
+    )
+    opt_prog.progress(1.0, text="NSGA-II 최적화 완료 (100%)")
+
     valid = filter_within_spec(candidates, objectives, kpi_spec_ranges)
     return candidates, valid, objectives, kpi_spec_ranges, cv_scores, parse_report, len(data)
 
 
 with st.sidebar:
-    st.markdown("### 📂 입력 데이터")
-    uploaded_file = st.file_uploader(
-        "설계/실측 데이터 파일 업로드 (XLSX, DB)",
-        type=["xlsx", "db"],
-        help="VOLVO_SPA12_CABJ_TRAIN_DATA 형식과 동일한 레이아웃의 엑셀 또는 SQLite DB 파일",
-    )
+    with st.expander("입력 데이터", expanded=True):
+        uploaded_file = st.file_uploader(
+            "설계/실측 데이터 파일 업로드 (XLSX, DB)",
+            type=["xlsx", "db"],
+            help="VOLVO_SPA12_CABJ_TRAIN_DATA 형식과 동일한 레이아웃의 엑셀 또는 SQLite DB 파일",
+        )
 
-    st.divider()
-
-    st.markdown("### ⚙️ 데이터 컨트롤")
-    pop_size = st.slider("Population Size", 40, 300, 120, step=20)
-    n_generations = st.slider("세대 수 (Generations)", 20, 200, 60, step=10)
-    seed = st.number_input("Random Seed", value=1, step=1)
-    run_btn = st.button("🚀 학습 초기화 및 재계산 실행", use_container_width=True)
-
-    st.divider()
-    st.caption(
-        "⚠️ 실측 데이터가 6개 샘플뿐입니다. 이 대시보드의 예측치는 "
-        "파이프라인 검증용 참고 자료이며, 실제 설계 확정에는 데이터 추가 확보가 필요합니다."
-    )
+    with st.expander("데이터 컨트롤", expanded=True):
+        pop_size = st.slider("Population Size", 40, 300, 120, step=20)
+        n_generations = st.slider("세대 수 (Generations)", 20, 200, 60, step=10)
+        seed = st.number_input("Random Seed", value=1, step=1)
+        run_btn = st.button("학습 초기화 및 재계산 실행", use_container_width=True)
+        st.caption(
+            "[주의] 실측 데이터가 6개 샘플뿐입니다. 이 대시보드의 예측치는 "
+            "파이프라인 검증용 참고 자료이며, 실제 설계 확정에는 데이터 추가 확보가 필요합니다."
+        )
 
     # ── 소유자 전용: 임시 비번 관리 패널 ──────────────────────────
     if st.session_state.get("is_owner", False):
-        st.divider()
-        st.markdown("### 🔐 임시 비밀번호 관리")
-
-        sheets_err = st.session_state.get("_sheets_last_error")
-        if sheets_err:
-            st.error(f"⚠️ Google Sheets 오류\n\n{sheets_err}")
-        else:
-            st.caption("🟢 Google Sheets 연결 정상")
-
-        if st.button("🔄 Sheets 연결 테스트", key="sb_test_sheets", use_container_width=True):
-            try:
-                test_ws = _get_temp_pwd_worksheet()
-                test_ws.get_all_records()
-                st.session_state["_sheets_last_error"] = None
-                st.success("✅ Sheets 연결 성공")
-            except Exception as e_test:
-                st.session_state["_sheets_last_error"] = f"[테스트 실패] {type(e_test).__name__}: {e_test}"
-                st.error(f"⚠️ {st.session_state['_sheets_last_error']}")
-
-        new_tp = st.text_input("새 임시 비밀번호", key="sb_new_tp")
-        exp_opt = st.selectbox("유효 기간", ["1일", "3일", "7일", "30일", "무제한"], key="sb_exp_sel")
-        day_map = {"1일": 1, "3일": 3, "7일": 7, "30일": 30, "무제한": None}
-
-        if st.button("➕ 추가", key="sb_add_tp", use_container_width=True):
-            if new_tp and new_tp != OWNER_PWD:
-                days = day_map.get(exp_opt)
-                exp_dt = (datetime.now() + timedelta(days=days)) if days else None
-                st.session_state.temp_pwd_list[new_tp] = {"expires": exp_dt, "created": datetime.now()}
-                saved_ok = _save_temp_pwds(st.session_state.temp_pwd_list)
-                if saved_ok:
-                    st.success(f"추가됨: {new_tp}")
-                else:
-                    st.error("⚠️ Sheets 저장 실패 — 위 오류 메시지를 확인하세요 (재시작 시 사라질 수 있습니다)")
-                st.rerun()
-            elif new_tp == OWNER_PWD:
-                st.error("소유자 비번은 사용할 수 없습니다.")
+        with st.expander("임시 비밀번호 관리", expanded=False):
+            sheets_err = st.session_state.get("_sheets_last_error")
+            if sheets_err:
+                st.error(f"[오류] Google Sheets 연결에 문제가 있습니다.\n\n{sheets_err}")
             else:
-                st.warning("비밀번호를 입력하세요.")
+                st.caption("Google Sheets 연결 정상")
 
-        if st.session_state.temp_pwd_list:
-            st.caption("등록된 임시 비밀번호")
-            for tp_k, tp_v in list(st.session_state.temp_pwd_list.items()):
-                exp_v = tp_v["expires"]
-                if exp_v is None:
-                    icon, txt = "🟢", "무제한"
-                elif datetime.now() < exp_v:
-                    hrs = int((exp_v - datetime.now()).total_seconds() // 3600)
-                    icon, txt = "🟡", f"남음: {hrs}시간"
-                else:
-                    icon, txt = "🔴", "만료됨"
-                rc1, rc2 = st.columns([3, 1])
-                rc1.markdown(
-                    f"<span style='font-size:0.8rem;'>{icon} <code>{tp_k}</code><br>"
-                    f"<span style='color:#8a8a8a;font-size:0.72rem;'>{txt}</span></span>",
-                    unsafe_allow_html=True,
-                )
-                if rc2.button("🗑️", key=f"sb_del_{tp_k}"):
-                    del st.session_state.temp_pwd_list[tp_k]
-                    _save_temp_pwds(st.session_state.temp_pwd_list)
+            if st.button("Sheets 연결 테스트", key="sb_test_sheets", use_container_width=True):
+                try:
+                    test_ws = _get_temp_pwd_worksheet()
+                    test_ws.get_all_records()
+                    st.session_state["_sheets_last_error"] = None
+                    st.success("Sheets 연결 성공")
+                except Exception as e_test:
+                    st.session_state["_sheets_last_error"] = f"[테스트 실패] {type(e_test).__name__}: {e_test}"
+                    st.error(f"[오류] {st.session_state['_sheets_last_error']}")
+
+            new_tp = st.text_input("새 임시 비밀번호", key="sb_new_tp")
+            exp_opt = st.selectbox("유효 기간", ["1일", "3일", "7일", "30일", "무제한"], key="sb_exp_sel")
+            day_map = {"1일": 1, "3일": 3, "7일": 7, "30일": 30, "무제한": None}
+
+            if st.button("추가", key="sb_add_tp", use_container_width=True):
+                if new_tp and new_tp != OWNER_PWD:
+                    days = day_map.get(exp_opt)
+                    exp_dt = (datetime.now() + timedelta(days=days)) if days else None
+                    st.session_state.temp_pwd_list[new_tp] = {"expires": exp_dt, "created": datetime.now()}
+                    saved_ok = _save_temp_pwds(st.session_state.temp_pwd_list)
+                    if saved_ok:
+                        st.success(f"추가됨: {new_tp}")
+                    else:
+                        st.error("[오류] Sheets 저장 실패 — 위 오류 메시지를 확인하세요 (재시작 시 사라질 수 있습니다)")
                     st.rerun()
-        else:
-            st.caption("등록된 임시 비밀번호가 없습니다.")
+                elif new_tp == OWNER_PWD:
+                    st.error("소유자 비번은 사용할 수 없습니다.")
+                else:
+                    st.warning("비밀번호를 입력하세요.")
+
+            if st.session_state.temp_pwd_list:
+                st.caption("등록된 임시 비밀번호")
+                for tp_k, tp_v in list(st.session_state.temp_pwd_list.items()):
+                    exp_v = tp_v["expires"]
+                    if exp_v is None:
+                        icon, txt = "[무제한]", "무제한"
+                    elif datetime.now() < exp_v:
+                        hrs = int((exp_v - datetime.now()).total_seconds() // 3600)
+                        icon, txt = "[사용중]", f"남음: {hrs}시간"
+                    else:
+                        icon, txt = "[만료]", "만료됨"
+                    rc1, rc2 = st.columns([3, 1])
+                    rc1.markdown(
+                        f"<span style='font-size:0.8rem;'>{icon} <code>{tp_k}</code><br>"
+                        f"<span style='color:#8a8a8a;font-size:0.72rem;'>{txt}</span></span>",
+                        unsafe_allow_html=True,
+                    )
+                    if rc2.button("삭제", key=f"sb_del_{tp_k}"):
+                        del st.session_state.temp_pwd_list[tp_k]
+                        _save_temp_pwds(st.session_state.temp_pwd_list)
+                        st.rerun()
+            else:
+                st.caption("등록된 임시 비밀번호가 없습니다.")
 
 if uploaded_file is None:
     st.info(
-        "📂 학습 비활성화: 왼쪽 사이드바에서 입력 데이터 파일(XLSX 또는 DB)을 업로드해주세요.\n\n"
+        "학습 비활성화: 왼쪽 사이드바에서 입력 데이터 파일(XLSX 또는 DB)을 업로드해주세요.\n\n"
         "VOLVO_SPA12_CABJ_TRAIN_DATA 원본과 동일한 레이아웃(2행: 변수명, 9행: 스펙, 3~8행: 실측 데이터)이어야 합니다."
     )
     st.stop()
 
 if run_btn:
-    with st.spinner("NSGA-II 다목적 최적화 실행 중..."):
-        st.session_state["computed"] = compute_candidates(
-            uploaded_file.getvalue(), uploaded_file.name, pop_size, n_generations, seed
-        )
+    st.session_state["computed"] = run_pipeline(
+        uploaded_file.getvalue(), uploaded_file.name, pop_size, n_generations, seed
+    )
 
 if "computed" not in st.session_state:
-    st.info("🚀 파일 업로드가 완료되었습니다. 사이드바의 \"학습 초기화 및 재계산 실행\" 버튼을 눌러 계산을 시작하세요.")
+    st.info("파일 업로드가 완료되었습니다. 사이드바의 \"학습 초기화 및 재계산 실행\" 버튼을 눌러 계산을 시작하세요.")
     st.stop()
 
 candidates, valid, objectives, kpi_spec_ranges, cv_scores, parse_report, n_samples = st.session_state["computed"]
@@ -467,224 +502,205 @@ for col, (label, value) in zip(stat_cols, stats):
 
 st.markdown("<div style='margin-top:18px;'></div>", unsafe_allow_html=True)
 
-tab1, tab2, tab3 = st.tabs(["📊 파레토 프론트", "📋 후보 목록", "🧬 변수 구성"])
+tab1, tab2, tab3 = st.tabs(["파레토 프론트", "후보 목록", "변수 구성"])
 
 with tab1:
-    st.markdown(
-        "<div class='glass-card'><div class='glass-card-title'>파레토 프론트 시각화</div>",
-        unsafe_allow_html=True,
-    )
+    with st.expander("파레토 프론트 시각화", expanded=True):
+        show_df = valid if len(valid) > 0 else candidates
+        if len(valid) == 0:
+            st.warning("스펙을 만족하는 후보가 없어 전체 후보를 표시합니다.")
 
-    show_df = valid if len(valid) > 0 else candidates
-    if len(valid) == 0:
-        st.warning("스펙을 만족하는 후보가 없어 전체 후보를 표시합니다.")
+        c1, c2, c3 = st.columns(3)
+        x_kpi = c1.selectbox("X축 KPI", kpi_names, index=kpi_names.index("axial_before_after_min_stiffness_%"))
+        y_kpi = c2.selectbox("Y축 KPI", kpi_names, index=kpi_names.index("breakaway_torque_Nm"))
+        color_kpi = c3.selectbox("색상(3번째 KPI)", kpi_names, index=kpi_names.index("radial_before_after_min_stiffness_%"))
 
-    c1, c2, c3 = st.columns(3)
-    x_kpi = c1.selectbox("X축 KPI", kpi_names, index=kpi_names.index("axial_before_after_min_stiffness_%"))
-    y_kpi = c2.selectbox("Y축 KPI", kpi_names, index=kpi_names.index("breakaway_torque_Nm"))
-    color_kpi = c3.selectbox("색상(3번째 KPI)", kpi_names, index=kpi_names.index("radial_before_after_min_stiffness_%"))
+        fig = px.scatter(
+            show_df, x=x_kpi, y=y_kpi, color=color_kpi,
+            color_continuous_scale=["#f87171", "#ff9f1c", "#10b981"],
+            hover_data=kpi_names,
+        )
+        fig.update_traces(marker=dict(size=11, line=dict(width=1, color="#0f0f0f")))
+        fig.update_layout(
+            height=520,
+            paper_bgcolor="#1a1a1a",
+            plot_bgcolor="#131313",
+            font=dict(color="#ececec", family="Inter"),
+            xaxis=dict(gridcolor="#2e2e2e", zerolinecolor="#2e2e2e"),
+            yaxis=dict(gridcolor="#2e2e2e", zerolinecolor="#2e2e2e"),
+            margin=dict(t=20, b=20),
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-    fig = px.scatter(
-        show_df, x=x_kpi, y=y_kpi, color=color_kpi,
-        color_continuous_scale=["#f87171", "#ff9f1c", "#10b981"],
-        hover_data=kpi_names,
-    )
-    fig.update_traces(marker=dict(size=11, line=dict(width=1, color="#0f0f0f")))
-    fig.update_layout(
-        height=520,
-        paper_bgcolor="#1a1a1a",
-        plot_bgcolor="#131313",
-        font=dict(color="#ececec", family="Inter"),
-        xaxis=dict(gridcolor="#2e2e2e", zerolinecolor="#2e2e2e"),
-        yaxis=dict(gridcolor="#2e2e2e", zerolinecolor="#2e2e2e"),
-        margin=dict(t=20, b=20),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.caption(
-        "각 점은 하나의 설계 후보(치수 조합)입니다. 두 KPI 사이 trade-off 곡선(파레토 프론트) 위에 "
-        "위치할수록 '이 두 지표 사이에서는 더 개선할 여지가 없는' 효율적인 후보입니다."
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.caption(
+            "각 점은 하나의 설계 후보(치수 조합)입니다. 두 KPI 사이 trade-off 곡선(파레토 프론트) 위에 "
+            "위치할수록 '이 두 지표 사이에서는 더 개선할 여지가 없는' 효율적인 후보입니다."
+        )
 
 with tab2:
-    st.markdown(
-        "<div class='glass-card'><div class='glass-card-title'>스펙 통과 후보 (Recommended Candidates)</div>",
-        unsafe_allow_html=True,
-    )
+    with st.expander("스펙 통과 후보 (Recommended Candidates)", expanded=True):
+        if len(valid) > 0:
+            sort_kpi = st.selectbox("정렬 기준 KPI", kpi_names,
+                                     index=kpi_names.index("axial_before_after_min_stiffness_%"))
+            sort_dir = next(o.direction for o in objectives if o.name == sort_kpi)
+            sorted_valid = valid.sort_values(sort_kpi, ascending=(sort_dir == "min")).reset_index(drop=True)
 
-    if len(valid) > 0:
-        sort_kpi = st.selectbox("정렬 기준 KPI", kpi_names,
-                                 index=kpi_names.index("axial_before_after_min_stiffness_%"))
-        sort_dir = next(o.direction for o in objectives if o.name == sort_kpi)
-        sorted_valid = valid.sort_values(sort_kpi, ascending=(sort_dir == "min")).reset_index(drop=True)
-
-        top_n = min(10, len(sorted_valid))
-        rows_html = ""
-        for i in range(top_n):
-            row = sorted_valid.iloc[i]
-            cells = ""
-            for kpi in kpi_names:
-                rng = kpi_spec_ranges.get(kpi)
-                val = row[kpi]
-                if rng is not None:
-                    lo, hi = rng
-                    ok = (lo is None or val >= lo) and (hi is None or val <= hi)
-                    color = "#10b981" if ok else "#f87171"
-                else:
-                    color = "#9c9c9c"
-                cells += (
-                    f"<td style='padding:6px 10px;text-align:center;font-family:JetBrains Mono,monospace;"
-                    f"color:{color};font-weight:700;'>{val:.3f}</td>"
+            top_n = min(10, len(sorted_valid))
+            rows_html = ""
+            for i in range(top_n):
+                row = sorted_valid.iloc[i]
+                cells = ""
+                for kpi in kpi_names:
+                    rng = kpi_spec_ranges.get(kpi)
+                    val = row[kpi]
+                    if rng is not None:
+                        lo, hi = rng
+                        ok = (lo is None or val >= lo) and (hi is None or val <= hi)
+                        color = "#10b981" if ok else "#f87171"
+                    else:
+                        color = "#9c9c9c"
+                    cells += (
+                        f"<td style='padding:6px 10px;text-align:center;font-family:JetBrains Mono,monospace;"
+                        f"color:{color};font-weight:700;'>{val:.3f}</td>"
+                    )
+                badge = (
+                    "<span style='background:#0f2410;color:#10b981;font-size:0.62rem;padding:1px 6px;"
+                    "border-radius:3px;margin-left:6px;'>PASS</span>"
                 )
-            badge = (
-                "<span style='background:#0f2410;color:#10b981;font-size:0.62rem;padding:1px 6px;"
-                "border-radius:3px;margin-left:6px;'>✅ PASS</span>"
+                rows_html += (
+                    f"<tr style='border-bottom:1px solid #262626;'>"
+                    f"<td style='padding:6px 10px;color:#ececec;font-weight:700;'>#{i+1}{badge}</td>"
+                    f"{cells}</tr>"
+                )
+
+            header_cells = "".join(
+                f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:center;"
+                f"text-transform:uppercase;'>{k}</th>"
+                for k in kpi_names
             )
+            st.markdown(
+                f"<div style='background:#131313;border:1px solid #2e2e2e;border-radius:8px;padding:12px 14px;"
+                f"overflow-x:auto;'>"
+                f"<table style='width:100%;border-collapse:collapse;'>"
+                f"<thead><tr style='border-bottom:1px solid #3a3a3a;'>"
+                f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>후보</th>"
+                f"{header_cells}</tr></thead><tbody>{rows_html}</tbody></table>"
+                f"<div style='color:#8a8a8a;font-size:0.72rem;margin-top:8px;'>"
+                f"※ 초록 = 스펙 통과 값 · 빨강 = 스펙 이탈 값 (참고용, 현재는 스펙 통과 후보만 표시됨)</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
+            dl_col1, dl_col2 = st.columns([1, 1])
+            with dl_col1:
+                dl_fmt = st.selectbox("내보내기 파일 포맷 선택", ["Excel/CSV (.csv)", "Database (.db)"],
+                                       key="candidates_dl_fmt", label_visibility="collapsed")
+            with dl_col2:
+                if "CSV" in dl_fmt:
+                    csv = sorted_valid.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button("전체 후보 다운로드", csv,
+                                        file_name="ball_joint_generative_candidates.csv", mime="text/csv")
+                else:
+                    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp_out:
+                        tmp_out_path = tmp_out.name
+                    conn_out = sqlite3.connect(tmp_out_path)
+                    sorted_valid.to_sql("candidates", conn_out, index=False, if_exists="replace")
+                    conn_out.close()
+                    with open(tmp_out_path, "rb") as f:
+                        db_bytes = f.read()
+                    os.remove(tmp_out_path)
+                    st.download_button("전체 후보 다운로드", db_bytes,
+                                        file_name="ball_joint_generative_candidates.db", mime="application/x-sqlite3")
+
+            st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
+            with st.expander("후보 상세 치수 보기", expanded=False):
+                idx = st.number_input("후보 번호 (표의 행 인덱스)", min_value=0,
+                                       max_value=len(sorted_valid) - 1, value=0, step=1)
+                detail = sorted_valid.iloc[int(idx)]
+                dim_cols = [c for c in sorted_valid.columns if c not in kpi_names]
+
+                detail_rows_html = ""
+                for c in dim_cols:
+                    kor = CONFIG.kor_labels.get(c, "")
+                    detail_rows_html += (
+                        f"<tr style='border-bottom:1px solid #262626;'>"
+                        f"<td style='padding:5px 10px;color:#ececec;font-weight:700;'>{c}</td>"
+                        f"<td style='padding:5px 10px;color:#9c9c9c;'>{kor}</td>"
+                        f"<td style='padding:5px 10px;text-align:center;font-family:JetBrains Mono,monospace;"
+                        f"color:#ff9f1c;font-weight:700;'>{detail[c]:.4f}</td></tr>"
+                    )
+                st.markdown(
+                    f"<div style='background:#131313;border:1px solid #2e2e2e;border-radius:8px;padding:12px 14px;"
+                    f"max-height:420px;overflow-y:auto;'>"
+                    f"<table style='width:100%;border-collapse:collapse;'>"
+                    f"<thead><tr style='border-bottom:1px solid #3a3a3a;'>"
+                    f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>변수</th>"
+                    f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>한글명</th>"
+                    f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:center;'>값(mm)</th>"
+                    f"</tr></thead><tbody>{detail_rows_html}</tbody></table></div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("스펙 통과 후보가 없습니다.")
+
+with tab3:
+    with st.expander("설계변수 구성 리포트", expanded=True):
+        reason_color = {
+            "스펙 파싱": "#10b981",
+            "형상공차(0~X)": "#10b981",
+            "파생(수식 계산)": "#ff9f1c",
+            "고정값": "#9c9c9c",
+        }
+        rows_html = ""
+        for p in parse_report:
+            name = p[0]
+            reason = p[1]
+            rng = p[2] if len(p) > 2 else ""
+            kor = CONFIG.kor_labels.get(name, "")
+            color = next((v for k, v in reason_color.items() if k in reason), "#f87171")
             rows_html += (
                 f"<tr style='border-bottom:1px solid #262626;'>"
-                f"<td style='padding:6px 10px;color:#ececec;font-weight:700;'>#{i+1}{badge}</td>"
-                f"{cells}</tr>"
+                f"<td style='padding:5px 10px;color:#ececec;font-weight:700;'>{name}</td>"
+                f"<td style='padding:5px 10px;color:#9c9c9c;'>{kor}</td>"
+                f"<td style='padding:5px 10px;'><span style='color:{color};font-weight:700;'>{reason}</span></td>"
+                f"<td style='padding:5px 10px;color:#9c9c9c;font-family:JetBrains Mono,monospace;'>{rng}</td>"
+                f"</tr>"
             )
-
-        header_cells = "".join(
-            f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:center;"
-            f"text-transform:uppercase;'>{k}</th>"
-            for k in kpi_names
-        )
         st.markdown(
             f"<div style='background:#131313;border:1px solid #2e2e2e;border-radius:8px;padding:12px 14px;"
-            f"overflow-x:auto;'>"
+            f"max-height:460px;overflow-y:auto;'>"
             f"<table style='width:100%;border-collapse:collapse;'>"
             f"<thead><tr style='border-bottom:1px solid #3a3a3a;'>"
-            f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>후보</th>"
-            f"{header_cells}</tr></thead><tbody>{rows_html}</tbody></table>"
+            f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>변수명</th>"
+            f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>한글명</th>"
+            f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>구분</th>"
+            f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>범위/비고</th>"
+            f"</tr></thead><tbody>{rows_html}</tbody></table>"
             f"<div style='color:#8a8a8a;font-size:0.72rem;margin-top:8px;'>"
-            f"★ 초록 = 스펙 통과 값 · 빨강 = 스펙 이탈 값 (참고용, 현재는 스펙 통과 후보만 표시됨)</div>"
+            f"● 스펙 파싱/형상공차(초록) · 파생(오렌지) · 고정값(회색) · 데이터기반(빨강)</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
 
-        st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-        dl_col1, dl_col2 = st.columns([1, 1])
-        with dl_col1:
-            dl_fmt = st.selectbox("내보내기 파일 포맷 선택", ["Excel/CSV (.csv)", "Database (.db)"],
-                                   key="candidates_dl_fmt", label_visibility="collapsed")
-        with dl_col2:
-            if "CSV" in dl_fmt:
-                csv = sorted_valid.to_csv(index=False).encode("utf-8-sig")
-                st.download_button("⬇️ 전체 후보 다운로드", csv,
-                                    file_name="ball_joint_generative_candidates.csv", mime="text/csv")
-            else:
-                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp_out:
-                    tmp_out_path = tmp_out.name
-                conn_out = sqlite3.connect(tmp_out_path)
-                sorted_valid.to_sql("candidates", conn_out, index=False, if_exists="replace")
-                conn_out.close()
-                with open(tmp_out_path, "rb") as f:
-                    db_bytes = f.read()
-                os.remove(tmp_out_path)
-                st.download_button("⬇️ 전체 후보 다운로드", db_bytes,
-                                    file_name="ball_joint_generative_candidates.db", mime="application/x-sqlite3")
-
-        st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-        st.markdown("<p style='font-size:0.85rem;font-weight:700;color:#ff9f1c;'>▣ 후보 상세 치수 보기</p>", unsafe_allow_html=True)
-        idx = st.number_input("후보 번호 (표의 행 인덱스)", min_value=0,
-                               max_value=len(sorted_valid) - 1, value=0, step=1)
-        detail = sorted_valid.iloc[int(idx)]
-        dim_cols = [c for c in sorted_valid.columns if c not in kpi_names]
-
-        detail_rows_html = ""
-        for c in dim_cols:
-            kor = CONFIG.kor_labels.get(c, "")
-            detail_rows_html += (
+    with st.expander("대리모델(Ridge) 참고 정확도 (LOO-MAE)", expanded=False):
+        cv_rows_html = ""
+        for k, v in cv_scores.items():
+            kor = CONFIG.kor_labels.get(k, "")
+            cv_rows_html += (
                 f"<tr style='border-bottom:1px solid #262626;'>"
-                f"<td style='padding:5px 10px;color:#ececec;font-weight:700;'>{c}</td>"
+                f"<td style='padding:5px 10px;color:#ececec;font-weight:700;'>{k}</td>"
                 f"<td style='padding:5px 10px;color:#9c9c9c;'>{kor}</td>"
                 f"<td style='padding:5px 10px;text-align:center;font-family:JetBrains Mono,monospace;"
-                f"color:#ff9f1c;font-weight:700;'>{detail[c]:.4f}</td></tr>"
+                f"color:#ff9f1c;font-weight:700;'>{v:.4f}</td></tr>"
             )
         st.markdown(
-            f"<div style='background:#131313;border:1px solid #2e2e2e;border-radius:8px;padding:12px 14px;"
-            f"max-height:420px;overflow-y:auto;'>"
+            f"<div style='background:#131313;border:1px solid #2e2e2e;border-radius:8px;padding:12px 14px;'>"
             f"<table style='width:100%;border-collapse:collapse;'>"
             f"<thead><tr style='border-bottom:1px solid #3a3a3a;'>"
-            f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>변수</th>"
+            f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>KPI</th>"
             f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>한글명</th>"
-            f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:center;'>값(mm)</th>"
-            f"</tr></thead><tbody>{detail_rows_html}</tbody></table></div>",
+            f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:center;'>LOO-MAE</th>"
+            f"</tr></thead><tbody>{cv_rows_html}</tbody></table></div>",
             unsafe_allow_html=True,
         )
-    else:
-        st.info("스펙 통과 후보가 없습니다.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with tab3:
-    st.markdown(
-        "<div class='glass-card'><div class='glass-card-title'>설계변수 구성 리포트</div>",
-        unsafe_allow_html=True,
-    )
-
-    reason_color = {
-        "스펙 파싱": "#10b981",
-        "형상공차(0~X)": "#10b981",
-        "파생(수식 계산)": "#ff9f1c",
-        "고정값": "#9c9c9c",
-    }
-    rows_html = ""
-    for p in parse_report:
-        name = p[0]
-        reason = p[1]
-        rng = p[2] if len(p) > 2 else ""
-        kor = CONFIG.kor_labels.get(name, "")
-        color = next((v for k, v in reason_color.items() if k in reason), "#f87171")
-        rows_html += (
-            f"<tr style='border-bottom:1px solid #262626;'>"
-            f"<td style='padding:5px 10px;color:#ececec;font-weight:700;'>{name}</td>"
-            f"<td style='padding:5px 10px;color:#9c9c9c;'>{kor}</td>"
-            f"<td style='padding:5px 10px;'><span style='color:{color};font-weight:700;'>{reason}</span></td>"
-            f"<td style='padding:5px 10px;color:#9c9c9c;font-family:JetBrains Mono,monospace;'>{rng}</td>"
-            f"</tr>"
-        )
-    st.markdown(
-        f"<div style='background:#131313;border:1px solid #2e2e2e;border-radius:8px;padding:12px 14px;"
-        f"max-height:460px;overflow-y:auto;'>"
-        f"<table style='width:100%;border-collapse:collapse;'>"
-        f"<thead><tr style='border-bottom:1px solid #3a3a3a;'>"
-        f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>변수명</th>"
-        f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>한글명</th>"
-        f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>구분</th>"
-        f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>범위/비고</th>"
-        f"</tr></thead><tbody>{rows_html}</tbody></table>"
-        f"<div style='color:#8a8a8a;font-size:0.72rem;margin-top:8px;'>"
-        f"● 스펙 파싱/형상공차(초록) · 파생(오렌지) · 고정값(회색) · 데이터기반(빨강)</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown(
-        "<div class='glass-card'><div class='glass-card-title'>대리모델(Ridge) 참고 정확도 (LOO-MAE)</div>",
-        unsafe_allow_html=True,
-    )
-    cv_rows_html = ""
-    for k, v in cv_scores.items():
-        kor = CONFIG.kor_labels.get(k, "")
-        cv_rows_html += (
-            f"<tr style='border-bottom:1px solid #262626;'>"
-            f"<td style='padding:5px 10px;color:#ececec;font-weight:700;'>{k}</td>"
-            f"<td style='padding:5px 10px;color:#9c9c9c;'>{kor}</td>"
-            f"<td style='padding:5px 10px;text-align:center;font-family:JetBrains Mono,monospace;"
-            f"color:#ff9f1c;font-weight:700;'>{v:.4f}</td></tr>"
-        )
-    st.markdown(
-        f"<div style='background:#131313;border:1px solid #2e2e2e;border-radius:8px;padding:12px 14px;'>"
-        f"<table style='width:100%;border-collapse:collapse;'>"
-        f"<thead><tr style='border-bottom:1px solid #3a3a3a;'>"
-        f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>KPI</th>"
-        f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:left;'>한글명</th>"
-        f"<th style='padding:5px 10px;font-size:0.68rem;color:#8a8a8a;text-align:center;'>LOO-MAE</th>"
-        f"</tr></thead><tbody>{cv_rows_html}</tbody></table></div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)

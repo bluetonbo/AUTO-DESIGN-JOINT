@@ -20,7 +20,7 @@ import plotly.express as px
 import gspread
 from google.oauth2.service_account import Credentials
 
-from generative_design.configs.ball_joint_volvo import CONFIG as BASE_CONFIG
+from generative_design.configs.ball_joint_volvo_proposal import CONFIG as BASE_CONFIG
 from generative_design.engine import (
     load_part_data, train_surrogate_models, make_predictor,
     run_nsga2, filter_within_spec,

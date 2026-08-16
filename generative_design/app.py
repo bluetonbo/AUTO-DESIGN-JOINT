@@ -20,7 +20,7 @@ import plotly.express as px
 import gspread
 from google.oauth2.service_account import Credentials
 
-from generative_design.configs.ball_joint_volvo_proposal import CONFIG as BASE_CONFIG
+from generative_design.configs.ball_joint_volvo import CONFIG as BASE_CONFIG
 from generative_design.engine import (
     load_part_data, train_surrogate_models, make_predictor,
     run_nsga2, filter_within_spec,
@@ -34,6 +34,10 @@ st.set_page_config(
 st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap');
+
+    html {
+        font-size: 90% !important;
+    }
 
     .stApp {
         background-color: #0f0f0f !important;
